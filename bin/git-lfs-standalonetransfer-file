@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+# vim: sw=4
+
+# Copyright (c) 2018/2019 Steffen Prohaska <prohaska@zib.de>.
+# Licensed under the MIT License.
+#
+# Latest version in Stdrepo `vissys_stdtools_*` file `git-lfs-transfer/bin/git-lfs-standalonetransfer-file`.
+#
+# Initial version in Gist <https://gist.github.com/sprohaska/f3cd4287d8c41b74fc808b5a5396cad1>
+
+# The `<ignore>` arg is necessary, because Git LFS handling of
+# `lfs.customtransfer.<name>.args` is broken (Sep 2017, git-lfs-2.3.1).  It
+# passes an empty string even if `args` is unset; grep for
+# `configureCustomAdapters()` in `github/git-lfs/git-lfs`.  This would ideally
+# be fixed in Git LFS.
+
+"""
+Usage:
+  git-lfs-standalonetransfer-file [--version] [<ignore>]
+
+Options:
+  --version     Print version and exit.
+
+`git-lfs-standalonetransfer-file` is a Git LFS standalone transfer agent for
+local files.  It implements the LFS standalone custom transfer agent protocol.
+It requires at least Git LFS 2.3.1.  It is ideally be used with Git LFS 2.4.1
+or later.  Configure it with:
+
+```
+git config lfs.customtransfer.file.path git-lfs-standalonetransfer-file
+git config lfs.file:///.standalonetransferagent file
+```
+
+The log is available with:
+
+```
+tail "$(git rev-parse --git-path lfs/tmp/git-lfs-standalonetransfer-file.log)"
+```
+
+Unless you use Git LFS 2.4.1 or later, which maps local paths to `file://`
+URLs, see PR-2912 <https://github.com/git-lfs/git-lfs/pull/2912>, explicitly
+configure `remote.origin.lfsurl`:
+
+```
+remote=origin
+if git config remote.${remote}.url | grep '^/'; then
+    git config remote.${remote}.lfsurl "file://$(git config remote.${remote}.url)"
+else
+    echo 'Error: invalid remote'
+fi
+```
+
+If URL matching does not work, a possible workaround is to configure the
+transfer agent unconditionally for all remotes:
+
+```
+git config lfs.customtransfer.file.path git-lfs-standalonetransfer-file
+git config lfs.standalonetransferagent file
+```
+"""
+
+from docopt import docopt
+from os.path import isdir, exists
+from os.path import join as pjoin
+from shutil import copyfile
+from subprocess import CalledProcessError, DEVNULL, STDOUT
+from subprocess import check_output
+from sys import stdin, stdout
+from time import time
+from traceback import format_exc
+import json
+import os
+import stat
+
+semver = '0.1.0'
+fullver = 'git-lfs-standalonetransfer-file-{}'.format(semver)
+
+E_REMOTE_URL = 11
+E_PATH = 12
+E_LINK = 13
+E_COPY = 14
+E_MKDIR = 15
+
+logout = None  # Set in `openLog()`.
+logpid = os.getpid()
+
+remoteLfsObjectsDir = None  # Set in `config()`.
+
+
+def main():
+    args = docopt(__doc__, version=fullver)
+    openLog()
+    log('started')
+    try:
+        process()
+    except Exception as err:
+        log(format_exc())
+        raise
+
+
+def openLog():
+    global logout
+    path = pjoin(gitLfsTmpDir(), 'git-lfs-standalonetransfer-file.log')
+    logout = open(path, 'a')
+
+
+def process():
+    for line in stdin:
+        log('received {}'.format(line.strip()))
+        req = json.loads(line)
+        event = req['event']
+        if event == 'init':
+            config(req)
+        elif event == 'upload':
+            upload(req)
+        elif event == 'download':
+            download(req)
+        elif event == 'terminate':
+            exit(0)
+        else:
+            die('Invalid event `{}`.'.format(event))
+
+
+def config(req):
+    url = req.get('remote')
+    if not url:
+        msg = 'Missing Git remote.  Is Git LFS >= 2.3.1?'
+        sendInitError(E_REMOTE_URL, msg)
+        die('init failed')
+
+    if not url.startswith('/'):
+        try:
+            url = gitConfig('remote.{}.url'.format(url))
+        except CalledProcessError as err:
+            msg = 'Failed to read Git remote URL: {}'.format(err)
+            sendInitError(E_REMOTE_URL, msg)
+            die('init failed')
+
+    if not url.startswith('/'):
+        sendInitError(E_PATH, 'Failed to determine Git remote path')
+        die('init failed')
+
+    try:
+        rdir = gitLfsObjectsDir(url)
+    except CalledProcessError as err:
+        msg = 'Failed to get Git LFS objects dir for remote: {}'.format(url)
+        sendInitError(E_PATH, msg)
+        die('init failed')
+
+    if not isdir(rdir):
+        msg = 'Missing remote dir: {}'.format(rdir)
+        sendInitError(E_PATH, msg)
+        die('init failed')
+
+    log('Using remote dir {}'.format(rdir))
+
+    global remoteLfsObjectsDir
+    remoteLfsObjectsDir = rdir
+
+    sendInitOk()
+
+
+def upload(req):
+    oid = req['oid']
+    size = req['size']
+    src = req['path']
+    dst = pjoin(remoteLfsObjectsDir, oid[0:2], oid[2:4], oid)
+
+    if exists(dst):
+        sendOk(oid, size)
+        return
+
+    tmp = '{}-{}.tmp'.format(dst, time())
+    isShared = isSharedDir(remoteLfsObjectsDir)
+
+    try:
+        ensureDir(pjoin(remoteLfsObjectsDir, oid[0:2]), isShared)
+        ensureDir(pjoin(remoteLfsObjectsDir, oid[0:2], oid[2:4]), isShared)
+    except OSError as err:
+        msg = 'Failed to mkdir remote: {}'.format(err)
+        sendError(oid, E_MKDIR, msg)
+        return
+
+    if canLink(src, remoteLfsObjectsDir):
+        try:
+            os.link(src, tmp)
+            os.replace(tmp, dst)
+        except OSError as err:
+            msg = 'Failed to link: {}'.format(err)
+            sendError(oid, E_LINK, msg)
+            return
+    else:
+        try:
+            copyfile(src, tmp)
+            os.replace(tmp, dst)
+        except OSError as err:
+            msg = 'Failed to copy: {}'.format(err)
+            sendError(oid, E_COPY, msg)
+            return
+
+    sendOk(oid, size)
+
+
+def download(req):
+    oid = req['oid']
+    size = req['size']
+
+    src = pjoin(remoteLfsObjectsDir, oid[0:2], oid[2:4], oid)
+    tmpdir = gitLfsTmpDir()
+    dst = pjoin(tmpdir, '{}-{}'.format(time(), oid))
+    if canLink(src, tmpdir):
+        # Link to temp.  LFS will link it to `lfs/objects/`.
+        try:
+            os.link(src, dst)
+        except OSError as err:
+            msg = 'Failed to link: {}'.format(err)
+            sendError(oid, E_LINK, msg)
+            return
+    else:
+        try:
+            copyfile(src, dst)
+        except OSError as err:
+            msg = 'Failed to copy: {}'.format(err)
+            sendError(oid, E_COPY, msg)
+            return
+
+    sendOk(oid, size, path=dst)
+
+
+# Link independent of the permissions if:
+#
+#  - Owned by the current user, because read-only can be ensured later.
+#
+# Do not link to another user's file if:
+#
+#  - It is writable, because the current user cannot fix the permissions.
+#  - It is not readable for the current user.
+#
+def canLink(src, dstdir):
+    try:
+        s = os.stat(src)
+        d = os.stat(dstdir)
+    except FileNotFoundError:
+        return False
+
+    # Hard link requires the same filesystem.
+    if s.st_dev != d.st_dev:
+        return False
+
+    if s.st_uid == os.getuid():
+        return True
+
+    mode = stat.S_IMODE(s.st_mode)
+    writeMask = 0o222
+    if mode & writeMask != 0:
+        return False
+
+    return os.access(src, os.R_OK)
+
+
+# Assume that it is a shared repo if the directory has SGID.  It correctly
+# works for `git init --shared`, which seems good enough for now.  A more
+# thorough solution would be to fully implement `core.sharedRepository`, see
+# `git init --help`, in `isSharedDir()` and `ensureDir()`.
+def isSharedDir(path):
+    return os.stat(path).st_mode & stat.S_ISGID != 0
+
+
+def ensureDir(path, shared):
+    if isdir(path):
+        return
+    os.mkdir(path)
+    if shared:
+        os.chmod(path, 0o770 | stat.S_ISGID)
+
+
+def gitLfsTmpDir():
+    cmd = ['git', 'rev-parse', '--git-path', 'lfs/tmp']
+    out = check_output(cmd, stdin=DEVNULL, stderr=STDOUT)
+    return out.decode('utf-8').strip()
+
+
+def gitLfsObjectsDir(cwd):
+    cmd = ['git', 'rev-parse', '--git-path', 'lfs/objects']
+    out = check_output(cmd, cwd=cwd, stdin=DEVNULL, stderr=STDOUT)
+    relpath = out.decode('utf-8').strip()
+    return pjoin(cwd, relpath)
+
+
+def gitConfig(var):
+    cmd = ['git', 'config', var]
+    out = check_output(cmd, stdin=DEVNULL, stderr=STDOUT)
+    return out.decode('utf-8').strip()
+
+
+def send(rsp):
+    stdout.write(json.dumps(rsp) + '\n')
+    stdout.flush()
+
+
+def sendOk(oid, size, path=None):
+    log('ok {}'.format(oid))
+    send({
+        'event': 'progress', 'oid': oid,
+        'bytesSoFar': size, 'bytesSinceLast': size,
+    })
+
+    rsp = {'event': 'complete', 'oid': oid}
+    if path:
+        rsp['path'] = path
+    send(rsp)
+
+
+def sendError(oid, code, msg):
+    log('error {} {} {}'.format(oid, code, msg))
+    err = {'code': code, 'message': msg}
+    send({'event': 'complete', 'oid': oid, 'error': err})
+
+
+def sendInitError(code, msg):
+    log('error init {} {}'.format(code, msg))
+    err = {'code': code, 'message': msg}
+    send({'error': err})
+
+
+def sendInitOk():
+    send({})
+
+
+def log(msg):
+    if not logout:
+        return
+    logout.write('[{}] {}\n'.format(logpid, msg))
+    logout.flush()
+
+
+def die(msg):
+    log('die: {}'.format(msg))
+    print('fatal: {}'.format(msg), file=stderr)
+    exit(1)
+
+
+if __name__ == '__main__':
+    main()
