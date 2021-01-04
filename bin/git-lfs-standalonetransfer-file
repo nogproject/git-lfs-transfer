@@ -23,8 +23,8 @@ Options:
 
 `git-lfs-standalonetransfer-file` is a Git LFS standalone transfer agent for
 local files.  It implements the LFS standalone custom transfer agent protocol.
-It requires at least Git LFS 2.3.1.  It is ideally be used with Git LFS 2.4.1
-or later.  Configure it with:
+It requires at least Git LFS 2.3.1.  Git LFS 2.4.1 or later is recommended.
+Configure it with:
 
 ```
 git config lfs.customtransfer.file.path git-lfs-standalonetransfer-file
